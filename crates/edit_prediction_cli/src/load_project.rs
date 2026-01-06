@@ -2,19 +2,17 @@ use crate::{
     example::{Example, ExampleBuffer, ExampleState},
     git,
     headless::EpAppState,
-    paths::WORKTREES_DIR,
     progress::{InfoStyle, Progress, Step, StepProgress},
 };
 use anyhow::{Context as _, Result};
 use edit_prediction::EditPredictionStore;
-use edit_prediction::udiff::OpenedBuffers;
+use edit_prediction::udiff::{OpenedBuffers, refresh_worktree_entries};
 use futures::AsyncWriteExt as _;
 use gpui::{AsyncApp, Entity};
 use language::{Anchor, Buffer, LanguageNotFound, ToOffset, ToPoint};
+use project::Project;
 use project::buffer_store::BufferStoreEvent;
-use project::{Project, ProjectPath};
 use std::{fs, path::PathBuf, sync::Arc};
-use util::{paths::PathStyle, rel_path::RelPath};
 
 pub async fn run_load_project(
     example: &mut Example,
@@ -77,15 +75,21 @@ async fn cursor_position(
         return Err(error);
     }
 
-    let worktree = project
-        .read_with(cx, |project, cx| project.visible_worktrees(cx).next())?
-        .context("project has no worktree")?;
+    // Since the worktree scanner is disabled, manually refresh entries for the cursor path.
+    if let Some(worktree) = project.read_with(cx, |project, cx| project.worktrees(cx).next())? {
+        refresh_worktree_entries(&worktree, [&*example.spec.cursor_path], cx).await?;
+    }
 
-    let worktree_id = worktree.read_with(cx, |wt, _| wt.id())?;
-    let cursor_path = ProjectPath {
-        worktree_id,
-        path: RelPath::new(example.spec.cursor_path.as_ref(), PathStyle::Posix)?.into_arc(),
-    };
+    let cursor_path = project
+        .read_with(cx, |project, cx| {
+            project.find_project_path(&example.spec.cursor_path, cx)
+        })?
+        .with_context(|| {
+            format!(
+                "failed to find cursor path {}",
+                example.spec.cursor_path.display()
+            )
+        })?;
 
     let cursor_buffer = project
         .update(cx, |project, cx| project.open_buffer(cursor_path, cx))?
@@ -187,15 +191,13 @@ async fn setup_project(
 }
 
 async fn setup_worktree(example: &Example, step_progress: &StepProgress) -> Result<PathBuf> {
-    let (repo_owner, repo_name) = example.repo_name().context("failed to get repo name")?;
+    let repo_name = example.repo_name().context("failed to get repo name")?;
     let repo_dir = git::repo_path_for_url(&example.spec.repository_url)?;
-    let worktree_path = WORKTREES_DIR
-        .join(repo_owner.as_ref())
-        .join(repo_name.as_ref());
+    let worktree_path = repo_name.worktree_path();
     let repo_lock = git::lock_repo(&repo_dir).await;
 
     if !repo_dir.is_dir() {
-        step_progress.set_substatus(format!("cloning {}", repo_name));
+        step_progress.set_substatus(format!("cloning {}", repo_name.name));
         fs::create_dir_all(&repo_dir)?;
         git::run_git(&repo_dir, &["init"]).await?;
         git::run_git(
